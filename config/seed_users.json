@@ -1,0 +1,9 @@
+{
+  "seed_users": [
+    "admin1@test.com",
+    "admin2@test.com",
+    "admin3@test.com",
+    "editor1@test.com",
+    "viewer1@test.com"
+  ]
+}
