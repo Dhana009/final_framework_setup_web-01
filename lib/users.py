@@ -9,10 +9,12 @@ Key Features:
 - File-based locking for cross-process coordination
 - Fail-fast when no users available
 - Automatic user release via context manager
+- Stale lock detection (5-minute timeout for crash recovery)
 """
 
 import json
 import os
+import time
 from typing import Dict, List, Optional, Any
 from pathlib import Path
 from utils.file_lock import AtomicLock
@@ -20,6 +22,10 @@ from utils.file_lock import AtomicLock
 
 # Session-level config cache (loaded once per test session)
 _config_cache: Optional[Dict[str, List[Dict[str, str]]]] = None
+
+# Stale lock timeout: 5 minutes (300 seconds)
+# If a user is BUSY for longer than this, consider it stale (worker crashed)
+_STALE_LOCK_TIMEOUT_SECONDS = 300.0  # 5 minutes
 
 
 def _load_config() -> Dict[str, List[Dict[str, str]]]:
@@ -77,6 +83,28 @@ def _save_state(state: Dict[str, Dict[str, str]]):
 
     with open(state_path, 'w') as f:
         json.dump(state, f, indent=2)
+
+
+def _is_stale(lease_info: Dict[str, Any], timeout_seconds: float) -> bool:
+    """Check if a user lease is stale (worker likely crashed).
+    
+    A lease is considered stale if:
+    - It has no timestamp (backward compatibility)
+    - The timestamp is older than the timeout threshold
+    
+    Args:
+        lease_info: Lease information dictionary
+        timeout_seconds: Timeout threshold in seconds
+        
+    Returns:
+        True if lease is stale, False otherwise
+    """
+    if "timestamp" not in lease_info:
+        # No timestamp = treat as stale (backward compatibility)
+        return True
+    
+    age = time.time() - lease_info["timestamp"]
+    return age > timeout_seconds
 
 
 class InfrastructureError(Exception):
@@ -157,13 +185,20 @@ class UserLease:
         with AtomicLock(lock_path):
             # Load state
             state = _load_state()
+            lease_state = state.get("lease", {})
 
-            # Find first free user
+            # Find first free user (check for stale locks)
             free_user = None
             for user in candidates:
                 email = user['email']
-                if email not in state:
+                if email not in lease_state:
                     # User is free
+                    free_user = user
+                    break
+                elif _is_stale(lease_state[email], _STALE_LOCK_TIMEOUT_SECONDS):
+                    # User is stale (worker crashed) - treat as free
+                    # Remove stale entry
+                    del lease_state[email]
                     free_user = user
                     break
 
@@ -175,9 +210,12 @@ class UserLease:
 
             # Mark user as BUSY
             email = free_user['email']
-            state[email] = {
+            if "lease" not in state:
+                state["lease"] = {}
+            state["lease"][email] = {
                 "role": self.role,
-                "status": "BUSY"
+                "status": "BUSY",
+                "timestamp": time.time()  # Record when user was acquired
             }
 
             # Save state
@@ -202,11 +240,12 @@ class UserLease:
         with AtomicLock(lock_path):
             # Load state
             state = _load_state()
+            lease_state = state.get("lease", {})
 
             # Remove user from state
             email = self.user['email']
-            if email in state:
-                del state[email]
+            if email in lease_state:
+                del lease_state[email]
 
             # Save state
             _save_state(state)

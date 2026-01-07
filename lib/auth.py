@@ -6,6 +6,7 @@ from typing import Optional, Dict, Any
 from pathlib import Path
 from utils.api_client import APIClient
 from utils.config import Config
+from utils.file_lock import AtomicLock
 
 
 # Session-level validation cache: {email: {valid: bool, timestamp: float}}
@@ -102,17 +103,19 @@ class SmartAuth:
             if age < 300 and cache_entry['valid']:  # 5 minutes = 300 seconds
                 # Use cached token - load state once
                 state = _load_state()
-                if self.email in state and 'token' in state[self.email]:
-                    self.token = state[self.email]['token']
+                auth_state = state.get("auth", {})
+                if self.email in auth_state and 'token' in auth_state[self.email]:
+                    self.token = auth_state[self.email]['token']
                     self.api.token = self.token
                     return self.token
 
         # Load state once - O(1) file read
         state = _load_state()
+        auth_state = state.get("auth", {})
         
         # Check if token exists in state
-        if self.email in state and 'token' in state[self.email]:
-            self.token = state[self.email]['token']
+        if self.email in auth_state and 'token' in auth_state[self.email]:
+            self.token = auth_state[self.email]['token']
             self.api.token = self.token
 
             # Validate token via API - O(1) API call
@@ -162,11 +165,17 @@ class SmartAuth:
         self.api.token = self.token
 
         # Save to state file - O(1) file write
-        state = _load_state()
-        if self.email not in state:
-            state[self.email] = {}
-        state[self.email]['token'] = self.token
-        _save_state(state)
+        # Use file lock to prevent race conditions with users.py and parallel auth calls
+        lock_path = str(_get_state_path()) + ".lock"
+        with AtomicLock(lock_path):
+            state = _load_state()
+            if "auth" not in state:
+                state["auth"] = {}
+            state["auth"][self.email] = {
+                **state["auth"].get(self.email, {}),
+                "token": self.token
+            }
+            _save_state(state)
 
         # Update cache - O(1) dictionary update
         _validation_cache[self.email] = {
@@ -195,11 +204,17 @@ class SmartAuth:
             self.api.token = self.token
 
             # Save to state
-            state = _load_state()
-            if self.email not in state:
-                state[self.email] = {}
-            state[self.email]['token'] = self.token
-            _save_state(state)
+            # Use file lock to prevent race conditions with users.py and parallel auth calls
+            lock_path = str(_get_state_path()) + ".lock"
+            with AtomicLock(lock_path):
+                state = _load_state()
+                if "auth" not in state:
+                    state["auth"] = {}
+                state["auth"][self.email] = {
+                    **state["auth"].get(self.email, {}),
+                    "token": self.token
+                }
+                _save_state(state)
 
             # Update cache
             _validation_cache[self.email] = {
